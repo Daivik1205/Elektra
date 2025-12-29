@@ -1,7 +1,12 @@
+
+xgboost
+lightgbm
 streamlit
-numpy
 pandas
-scikit-learn
+numpy
 tensorflow
-joblib
+scikit-learn
 scipy
+joblib
+plotly
+matplotlib
