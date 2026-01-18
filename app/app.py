@@ -1,145 +1,286 @@
-import sys
-import os
+import streamlit as st
 import time
 import pandas as pd
-import streamlit as st
+import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
+import sys
+import os
+import datetime
 
-# Fix Import Path
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+# Path Setup
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from simulation.ev_signal_generator import generate_ev_signal_row
-from inference.soc_predictor import predict_soc
-from inference.soh_predictor import predict_soh
+from simulation.ev_signal_generator import EVSignalGenerator
+from inference.soc_predictor import SOCPredictor
+from inference.soh_predictor import SOHPredictor
+from utils.dvdq_features import load_dvdq_features
 from safety.health_rules import check_safety
 
-# ---- CONFIG ----
-st.set_page_config(page_title="Elektra Dashboard", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Elektra BMS Pro", page_icon="⚡", layout="wide")
 
+# --- CSS ---
 st.markdown("""
-<style>
-    [data-testid="stMetricValue"] { font-family: 'Courier New'; font-weight: bold; }
-    .stApp { background-color: #0E1117; }
-</style>
+    <style>
+        div[data-testid="stMetric"] {
+            background-color: #121212;
+            padding: 15px;
+            border-radius: 10px;
+            border: 1px solid #333;
+            min-height: 140px; 
+            overflow: hidden;
+        }
+        div[data-testid="stPlotlyChart"] {
+            background-color: #121212;
+            border-radius: 10px;
+            border: 1px solid #333;
+            padding: 5px;
+            min-height: 380px;
+        }
+        .live-val-box {
+            font-family: 'Courier New', monospace;
+            font-size: 26px;
+            font-weight: bold;
+            text-align: center;
+            padding: 12px;
+            margin-top: 10px;
+            border-radius: 8px;
+            background-color: #1E1E1E;
+            border: 1px solid #444;
+        }
+        .val-v { color: #00CCFF; }
+        .val-i { color: #FF5500; }
+        .clock-box { color: #888; font-size: 14px; text-align: center; }
+        .stDeployButton {display:none;}
+        header {display: none;}
+        .block-container { padding-top: 1rem; }
+    </style>
 """, unsafe_allow_html=True)
 
-# ---- STATE ----
-MAX_HISTORY = 100 
-if "data" not in st.session_state:
-    st.session_state.data = pd.DataFrame(columns=["time", "voltage", "current", "temperature", "power"])
-if "t" not in st.session_state:
-    st.session_state.t = 0
-if 'run_sim' not in st.session_state:
-    st.session_state.run_sim = False
+NOMINAL_CAPACITY = 100.0
 
-# ---- SIDEBAR ----
-with st.sidebar:
-    st.header("⚙️ Controls")
-    def toggle_run():
-        st.session_state.run_sim = not st.session_state.run_sim
+# --- STATE ---
+if 'car' not in st.session_state:
+    st.session_state.car = EVSignalGenerator()
+    st.session_state.soc_ai = SOCPredictor()
+    st.session_state.soh_ai = SOHPredictor()
+    st.session_state.history = pd.DataFrame(columns=["time", "voltage", "current", "soc", "temperature", "voltage_std", "capacity_ratio"])
+    st.session_state.cycle_count = 10.0
+    st.session_state.simulation_running = False
+    st.session_state.sim_clock = 0.0 # Track simulated seconds
+    st.session_state.smoothed_soc = 50.0  # Smoothed SOC
+    st.session_state.smoothed_soh = 100.0  # Smoothed SOH
+    st.session_state.soc_alpha = 0.15  # EMA smoothing factor for SOC
+    st.session_state.soh_alpha = 0.1   # EMA smoothing factor for SOH
+    st.session_state.soh_buffer = []  # Buffer for SOH predictions to stabilize
+    st.session_state.soh_buffer_size = 20  # Number of predictions to collect before smoothing
+    st.session_state.last_cycle_count = 10.0  # Track cycle changes
+    st.session_state.current_capacity_ah = 100.0  # Current capacity that degrades
+    st.session_state.capacity_history = [100.0]  # Track capacity over time
+    st.session_state.last_cycle_count = 10.0  # Track cycle changes
+
+@st.cache_resource
+def get_chemistry_features():
+    anode = load_dvdq_features("data/dv_dq_anode.csv", "anode")
+    cathode = load_dvdq_features("data/dv_dq_cathode.csv", "cathode")
+    return {**anode, **cathode}
+
+static_features = get_chemistry_features()
+
+# --- UI ---
+st.title("⚡ Elektra: Digital Twin")
+st.sidebar.header("🎮 Controls")
+
+# Initialize operation mode in session state
+if "operation_mode" not in st.session_state:
+    st.session_state.operation_mode = "STANDBY"
+
+# Mode Selection with centered buttons
+st.sidebar.subheader("Operation Mode")
+mode_col1, mode_col2, mode_col3 = st.sidebar.columns(3)
+
+with mode_col1:
+    if st.sidebar.button("🔌 CHARGE", use_container_width=True):
+        st.session_state.operation_mode = "CHARGE"
+        st.session_state.car.set_mode("CHARGE")
+
+with mode_col2:
+    if st.sidebar.button("🚗 DRIVE", use_container_width=True):
+        st.session_state.operation_mode = "DISCHARGE"
+        st.session_state.car.set_mode("DISCHARGE")
+
+with mode_col3:
+    if st.sidebar.button("⏸️ IDLE", use_container_width=True):
+        st.session_state.operation_mode = "STANDBY"
+        st.session_state.car.set_mode("STANDBY")
+
+st.sidebar.divider()
+
+# Start/Stop simulation
+sim_col1, sim_col2 = st.sidebar.columns([2, 1])
+with sim_col1:
+    if st.sidebar.button("▶️ START SIM", type="primary", use_container_width=True):
+        st.session_state.simulation_running = True
+
+with sim_col2:
+    if st.sidebar.button("⏹️ STOP", use_container_width=True):
+        st.session_state.simulation_running = False
+
+st.sidebar.divider()
+
+# Speed Slider (1x to 5000x)
+speed_factor = st.sidebar.slider("⚡ Speed (x)", 1, 5000, 100)
+
+# Cycle Slider
+cycle_input = st.sidebar.slider(
+    "🔄 Battery Age (Cycles)", 
+    min_value=0.0, max_value=5000.0, 
+    value=float(st.session_state.cycle_count), step=10.0
+)
+st.session_state.cycle_count = cycle_input
+
+# Display current mode
+mode_color = {"CHARGE": "🟢", "DISCHARGE": "🔴", "STANDBY": "⚪"}
+st.sidebar.info(f"{mode_color.get(st.session_state.operation_mode, '⚪')} Mode: **{st.session_state.operation_mode}**")
+
+m1, m2, m3, m4 = st.columns(4)
+c1, c2 = st.columns(2)
+clock_ph = st.empty()
+
+# --- RUN LOOP ---
+if st.session_state.simulation_running:
     
-    st.button("Start/Stop Simulation", on_click=toggle_run)
-    status_text = "Running 🟢" if st.session_state.run_sim else "Paused 🔴"
+    # 1. PHYSICS STEP
+    real_dt = 0.1 # We update screen every 0.1s
     
-    speed = st.slider("Update Speed", 0.05, 1.0, 0.1)
+    # Pass 'real_dt' and 'speed_factor' to physics
+    data = st.session_state.car.step(real_dt, speed_factor)
     
-    if st.button("Reset System"):
-        st.session_state.data = pd.DataFrame(columns=["time", "voltage", "current", "temperature", "power"])
-        st.session_state.t = 0
-        st.rerun()
+    # Update Simulated Clock
+    st.session_state.sim_clock += (real_dt * speed_factor)
+    sim_time_str = str(datetime.timedelta(seconds=int(st.session_state.sim_clock)))
 
-# ---- LAYOUT ----
-c1, c2 = st.columns([3, 1])
-c1.title("⚡ Elektra Intelligent BMS")
-c2.markdown(f"### {status_text}")
+    # 3. CALCULATE REALISTIC CAPACITY DEGRADATION
+    # Capacity degrades with: cycles + temperature + current stress
+    cycle_degradation = cycle_input * 0.00015  # 0.015% per cycle
+    temp_stress = max(0, (data['temperature'] - 25) * 0.0001)  # Higher temp = more degradation
+    current_stress = abs(data['current']) * 0.00000005  # High current = more stress
+    
+    # Total degradation rate
+    total_degradation = cycle_degradation + temp_stress + current_stress
+    st.session_state.current_capacity_ah = NOMINAL_CAPACITY * (1.0 - total_degradation)
+    st.session_state.current_capacity_ah = np.clip(st.session_state.current_capacity_ah, NOMINAL_CAPACITY * 0.5, NOMINAL_CAPACITY)
+    
+    # Track capacity history
+    st.session_state.capacity_history.append(st.session_state.current_capacity_ah)
+    if len(st.session_state.capacity_history) > 100:
+        st.session_state.capacity_history.pop(0)
+    
+    # Calculate capacity_ratio (current capacity / nominal)
+    capacity_ratio = st.session_state.current_capacity_ah / NOMINAL_CAPACITY
+    
+    # Calculate delta_capacity (rate of change)
+    if len(st.session_state.capacity_history) > 1:
+        delta_cap = (st.session_state.capacity_history[-1] - st.session_state.capacity_history[-2]) / st.session_state.capacity_history[-1]
+    else:
+        delta_cap = 0.0
+    
+    # 4. HISTORY WITH REALISTIC VALUES
+    new_row = pd.DataFrame([{
+        "time": pd.to_datetime(data['time'], unit='s'),
+        "voltage": data['voltage'],
+        "current": data['current'],
+        "soc": 0,  # Will be updated after prediction
+        "temperature": data['temperature'],
+        "voltage_std": 0, 
+        "capacity_ratio": capacity_ratio,
+        "power": data.get('power', 0)
+    }])
+    st.session_state.history = pd.concat([st.session_state.history, new_row]).tail(100)
+    
+    # 5. FEATURES
+    hist = st.session_state.history
+    current_std = hist['voltage'].rolling(5).std().fillna(0).iloc[-1]
+    roll_std = hist['voltage'].rolling(10).std().mean()
+    if pd.isna(roll_std): roll_std = 0.0
+    if pd.isna(delta_cap): delta_cap = 0.0
 
-# Create Fixed Placeholders
-top = st.container()
-with top:
-    k1, k2, k3 = st.columns([1.5, 1.5, 1])
-    soc_ph = k1.empty()
-    soh_ph = k2.empty()
-    stat_ph = k3.empty()
+    # 6. PREDICT (AI MODELS ONLY)
+    # SOC Prediction from AI model
+    pred_soc_raw = st.session_state.soc_ai.predict(data['voltage'], data['current'], data['temperature'], data['time'])
+    
+    # Smooth SOC using exponential moving average
+    st.session_state.smoothed_soc = (st.session_state.soc_alpha * pred_soc_raw) + ((1 - st.session_state.soc_alpha) * st.session_state.smoothed_soc)
+    pred_soc = st.session_state.smoothed_soc
+    
+    # SOH Prediction from AI model with REALISTIC degraded values
+    pred_soh_raw = st.session_state.soh_ai.predict(
+        dynamic_features={
+            "cycle": int(cycle_input),
+            "mean_voltage": hist['voltage'].mean(),
+            "voltage_std": current_std,
+            "min_voltage": hist['voltage'].min(),
+            "max_voltage": hist['voltage'].max(),
+            "capacity_ah": st.session_state.current_capacity_ah,  # Use degraded capacity
+            "capacity_ratio": capacity_ratio,  # Use realistic ratio
+            "delta_capacity": delta_cap,  # Use real degradation rate
+            "rolling_voltage_std": roll_std
+        },
+        static_features=static_features
+    )
+    
+    # Buffer SOH predictions for smoother initialization
+    st.session_state.soh_buffer.append(pred_soh_raw)
+    
+    # Once buffer is full, use it for smoothing
+    if len(st.session_state.soh_buffer) > st.session_state.soh_buffer_size:
+        st.session_state.soh_buffer.pop(0)  # Remove oldest
+        buffer_mean = np.mean(st.session_state.soh_buffer)
+        st.session_state.smoothed_soh = (st.session_state.soh_alpha * buffer_mean) + ((1 - st.session_state.soh_alpha) * st.session_state.smoothed_soh)
+    else:
+        # During buffer filling phase, use simple average
+        if len(st.session_state.soh_buffer) >= 5:
+            buffer_mean = np.mean(st.session_state.soh_buffer)
+            st.session_state.smoothed_soh = (st.session_state.soh_alpha * buffer_mean) + ((1 - st.session_state.soh_alpha) * st.session_state.smoothed_soh)
+    
+    pred_soh = np.clip(st.session_state.smoothed_soh, 0, 100)
+    
+    # Update history with predicted SOC
+    st.session_state.history.iloc[-1, st.session_state.history.columns.get_loc('soc')] = pred_soc
 
-st.divider()
-chart_row = st.container()
-with chart_row:
-    g1, g2 = st.columns(2)
-    volt_ph = g1.empty()
-    temp_ph = g2.empty()
+    # 5. RENDER
+    # Show SIMULATED TIME and MODE
+    clock_ph.markdown(f"<div class='clock-box'>⏱️ Simulated: {sim_time_str} | 🔋 Mode: {st.session_state.operation_mode}</div>", unsafe_allow_html=True)
 
-alert_ph = st.empty()
+    m1.metric("⚡ SOC", f"{pred_soc:.1f}%")
+    m2.metric("❤️ SOH", f"{pred_soh:.1f}%")
+    m3.metric("🔄 Cycles", f"{int(cycle_input)}")
+    m4.metric("🌡️ Temp", f"{data['temperature']:.1f}°C")
+    
+    with c1:
+        st.markdown(f"<div class='live-val-box val-v'>{data['voltage']:.2f} V</div>", unsafe_allow_html=True)
+        fig_v = go.Figure()
+        fig_v.add_trace(go.Scatter(x=hist['time'], y=hist['voltage'], mode='lines', line=dict(color='#00CCFF', width=2)))
+        fig_v.update_layout(title="<b>Voltage</b>", height=350, margin=dict(t=30,b=10,l=10,r=10), template="plotly_dark", uirevision='const', xaxis=dict(showticklabels=False), yaxis=dict(showgrid=True, gridcolor='#333'), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig_v, use_container_width=True)
 
-def create_gauge(val, title, stops):
-    return go.Figure(go.Indicator(
-        mode="gauge+number", value=val, title={'text': title},
-        gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "white"}, 'steps': stops, 'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 99}}
-    )).update_layout(height=250, margin=dict(t=50, b=20, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)", font={'color': "white"})
+    with c2:
+        power = data['voltage'] * abs(data['current']) / 1000.0
+        st.markdown(f"<div class='live-val-box val-i'>{data['current']:.2f} A | {power:.1f} kW</div>", unsafe_allow_html=True)
+        fig_i = go.Figure()
+        fig_i.add_trace(go.Scatter(x=hist['time'], y=hist['current'], fill='tozeroy', line=dict(color='#FF5500')))
+        fig_i.add_trace(go.Scatter(x=hist['time'], y=hist['temperature'], name='Temp', yaxis='y2', line=dict(color='yellow', dash='dot')))
+        fig_i.update_layout(title="<b>Current / Temp</b>", height=350, margin=dict(t=30,b=10,l=10,r=10), template="plotly_dark", uirevision='const', xaxis=dict(showticklabels=False), yaxis=dict(showgrid=True, gridcolor='#333'), yaxis2=dict(overlaying='y', side='right', showgrid=False), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig_i, use_container_width=True)
 
-# ---- MAIN LOOP ----
-if st.session_state.run_sim:
-    while st.session_state.run_sim:
-        # 1. Generate Data
-        row = generate_ev_signal_row(st.session_state.t)
-        st.session_state.t += 1
-        
-        # Efficient DataFrame Update
-        st.session_state.data = pd.concat([st.session_state.data, pd.DataFrame([row])], ignore_index=True).tail(MAX_HISTORY)
-        
-        # 2. Predict SOC
-        window = st.session_state.data.tail(30)
-        soc = predict_soc(window)
+    # Alerts
+    alerts = check_safety(pred_soc, pred_soh, data['temperature'])
+    if alerts:
+        st.error(f"⚠️ {alerts[0]}")
+    else:
+        st.success("✅ System Nominal")
 
-        # ---- 🚀 TIME TRAVEL LOGIC ----
-        # In reality, SOH takes years to drop. 
-        # Here, we add 5 CYCLES per step. 
-        # So 10 seconds of simulation = 50 cycles (approx 3 months of aging).
-        sim_cycle = st.session_state.t * 5.0 
-        
-        # We also degrade capacity_ah artificially so the model sees correlation
-        current_capacity = 2.5 * max(0.5, (1.0 - (sim_cycle * 0.001)))
+    time.sleep(0.05)
+    st.rerun()
 
-        soh = predict_soh(
-            cycle=sim_cycle,
-            mean_voltage=window["voltage"].mean(),
-            voltage_std=window["voltage"].std(),
-            min_voltage=window["voltage"].min(),
-            max_voltage=window["voltage"].max(),
-            capacity_ah=current_capacity, 
-            capacity_ratio=0.95,
-            delta_capacity=-0.002,
-            rolling_voltage_std=window["voltage"].std()
-        )
-        
-        range_est = (soc / 100) * 300 * (soh / 100) # Range drops as health drops!
-
-        # 3. Update UI
-        key_id = st.session_state.t # Unique key for this frame
-        
-        soc_ph.plotly_chart(create_gauge(soc, "SOC (%)", [{'range': [0, 20], 'color': "red"}, {'range': [20, 100], 'color': "#00CC96"}]), use_container_width=True, key=f"soc_{key_id}")
-        
-        soh_ph.plotly_chart(create_gauge(soh, "SOH (%)", [{'range': [0, 70], 'color': "red"}, {'range': [70, 100], 'color': "#636EFA"}]), use_container_width=True, key=f"soh_{key_id}")
-        
-        stat_ph.metric("🚗 Est. Range", f"{range_est:.1f} mi", delta=f"{row['power']:.1f} W")
-        
-        # Charts
-        v_fig = px.line(st.session_state.data, x="time", y="voltage", title="Voltage (V)", height=300)
-        v_fig.update_traces(line_color='#00CC96')
-        volt_ph.plotly_chart(v_fig, use_container_width=True, key=f"v_{key_id}")
-        
-        t_fig = px.line(st.session_state.data, x="time", y=["current", "temperature"], title="Current & Temp", height=300)
-        temp_ph.plotly_chart(t_fig, use_container_width=True, key=f"t_{key_id}")
-        
-        # Alerts
-        alerts = check_safety(soc, soh, row['temperature'])
-        with alert_ph.container():
-            st.subheader("🛡️ Diagnostics")
-            for a in alerts:
-                if "normal" in a: st.success(a)
-                elif "Low" in a or "degrading" in a: st.warning(a)
-                else: st.error(a)
-        
-        time.sleep(speed)
+else:
+    st.info(f"🛑 Stopped | Mode: **{st.session_state.operation_mode}** | Press ▶️ to start simulation")
